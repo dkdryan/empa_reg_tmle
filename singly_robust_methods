@@ -1,0 +1,1565 @@
+# EMPA-REG TRIAL EMULATION: Singly-robust methods 
+# Cox regression, g-computation, IPTW, diagnostics 
+#
+# ==============================================================================
+
+# ==============================================================================
+# 0. SETUP
+# ==============================================================================
+
+library(survival)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(splines)
+library(cobalt)
+library(riskRegression)
+library(adjustedCurves)
+
+options(scipen = 999)
+
+# ------------------------------------------------------------------------------
+# User settings
+# ------------------------------------------------------------------------------
+
+project_dir <- ""
+data_file   <- "mdi_regular.csv"
+
+setwd(project_dir)
+
+tau_years <- 3
+tau       <- tau_years * 365.25
+
+B         <- 1000
+boot_seed <- 3001
+
+# ------------------------------------------------------------------------------
+# Output folders
+# ------------------------------------------------------------------------------
+
+output_dir <- file.path(project_dir, "cox_iptw_export_v2")
+table_dir  <- file.path(output_dir, "01_tables")
+figure_dir <- file.path(output_dir, "02_figures")
+model_dir  <- file.path(output_dir, "03_model_output")
+boot_dir   <- file.path(output_dir, "04_bootstrap")
+object_dir <- file.path(output_dir, "05_r_objects")
+log_dir    <- file.path(output_dir, "06_logs")
+
+dirs <- c(
+  output_dir,
+  table_dir,
+  figure_dir,
+  model_dir,
+  boot_dir,
+  object_dir,
+  log_dir
+)
+
+invisible(lapply(dirs, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+# ------------------------------------------------------------------------------
+# Import
+# ------------------------------------------------------------------------------
+
+df <- read.csv(data_file)
+
+df$died <- as.integer(df$died)
+df$empa <- as.integer(df$empa)
+
+# Basic checks
+required_columns <- c("time", "died", "empa")
+missing_columns <- setdiff(required_columns, names(df))
+
+# Save a lightweight analysis manifest
+analysis_settings <- tibble(
+  setting = c(
+    "Data file",
+    "3-year estimand in days",
+    "Bootstrap repetitions",
+    "Bootstrap seed",
+    "Manual IPTW truncation"
+  ),
+  value = c(
+    data_file,
+    as.character(tau),
+    as.character(B),
+    as.character(boot_seed),
+    "Upper 99th percentile"
+  )
+)
+
+# ==============================================================================
+# 1. MODEL FORMULAE
+# ==============================================================================
+
+adjustment_terms <- c(
+  "male",
+  "cohort_year_recoded",
+  "age_at_initiation",
+  "completed_eth_recoded", "mi_eth_recoded",
+  "completed_smoking_status", "mi_smoking_status",
+  "completed_sbp_at_initiation", "mi_sbp_at_initiation",
+  "completed_bmi_at_initiation", "mi_bmi_at_initiation",
+  "completed_hba1c_at_initiation", "mi_hba1c_at_initiation",
+  "completed_ldl_at_initiation", "mi_ldl_at_initiation",
+  "completed_hdl_at_initiation", "mi_hdl_at_initiation",
+  "completed_egfr_at_initiation", "mi_egfr_at_initiation",
+  "su_before_initiation",
+  "metformin_monotherapy_before_initiation",
+  "lipid_lowering_before_initiation",
+  "anti_htn_before_initiation",
+  "glp1ra_before_initiation",
+  "anti_platelet_before_initiation",
+  "anticoag_before_initiation",
+  "insulin_before_initiation",
+  "hf", "smi", "copd", "ra", "asthma",
+  "epilepsy", "dementia", "ibd", "liver",
+  "imd_quintile",
+  "cancer_diagnosis_5y_before_cohort"
+)
+
+unadj_formula <- Surv(time, died) ~ empa
+
+adj_formula <- as.formula(
+  paste(
+    "Surv(time, died) ~ empa +",
+    paste(adjustment_terms, collapse = " + ")
+  )
+)
+# ==============================================================================
+# 2. HELPER FUNCTIONS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Extract HR + Wald 95% CI
+# ------------------------------------------------------------------------------
+
+extract_hr <- function(fit, term = "empa") {
+  
+  beta <- unname(coef(fit)[term])
+  se   <- sqrt(unname(vcov(fit)[term, term]))
+  
+  c(
+    estimate = exp(beta),
+    lower    = exp(beta - 1.96 * se),
+    upper    = exp(beta + 1.96 * se)
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Marginal / g-computation risk at tau from a fitted Cox model
+#
+# S_i(t | A=a) = exp[-H0(t) exp(LP_i(a))]
+# Risk_i(t | A=a) = 1 - S_i(t | A=a)
+#
+# Individual counterfactual risks are averaged over the analysis population.
+# ------------------------------------------------------------------------------
+
+standardise_cox <- function(fit, data, tau = 3 * 365.25) {
+  
+  data0 <- data
+  data1 <- data
+  
+  data0$empa <- 0L
+  data1$empa <- 1L
+  
+  bh <- basehaz(fit, centered = TRUE)
+  idx <- which(bh$time <= tau)
+  
+  H0_tau <- if (length(idx) == 0) {
+    0
+  } else {
+    bh$hazard[max(idx)]
+  }
+  
+  lp0 <- predict(
+    fit,
+    newdata = data0,
+    type = "lp",
+    reference = "sample"
+  )
+  
+  lp1 <- predict(
+    fit,
+    newdata = data1,
+    type = "lp",
+    reference = "sample"
+  )
+  
+  risk0_i <- 1 - exp(-H0_tau * exp(lp0))
+  risk1_i <- 1 - exp(-H0_tau * exp(lp1))
+  
+  risk0 <- mean(risk0_i, na.rm = TRUE)
+  risk1 <- mean(risk1_i, na.rm = TRUE)
+  
+  c(
+    risk_dpp4i = risk0,
+    risk_empa  = risk1,
+    RD         = risk1 - risk0,
+    RR         = risk1 / risk0
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Bootstrap standardised Cox estimands
+# ------------------------------------------------------------------------------
+
+bootstrap_standardised_cox <- function(
+    data,
+    formula,
+    B = 1000,
+    tau = 3 * 365.25,
+    seed = 3001,
+    label = "bootstrap") {
+  
+  set.seed(seed)
+  
+  out <- matrix(
+    NA_real_,
+    nrow = B,
+    ncol = 4,
+    dimnames = list(
+      NULL,
+      c("risk_dpp4i", "risk_empa", "RD", "RR")
+    )
+  )
+  
+  for (b in seq_len(B)) {
+    
+    idx <- sample.int(
+      n = nrow(data),
+      size = nrow(data),
+      replace = TRUE
+    )
+    
+    boot_data <- data[idx, , drop = FALSE]
+    
+    result_b <- tryCatch({
+      
+      boot_fit <- coxph(
+        formula,
+        data = boot_data,
+        ties = "efron", 
+        model = TRUE, 
+        x = TRUE, 
+        y = TRUE
+      )
+      
+      standardise_cox(
+        fit = boot_fit,
+        data = boot_data,
+        tau = tau
+      )
+      
+    }, error = function(e) {
+      
+      message(
+        sprintf(
+          "%s failed at bootstrap %d: %s",
+          label,
+          b,
+          conditionMessage(e)
+        )
+      )
+      
+      rep(NA_real_, 4)
+    })
+    
+    out[b, ] <- result_b
+    
+    if (b %% 100 == 0 || b == B) {
+      message(label, ": completed ", b, "/", B)
+    }
+  }
+  
+  as.data.frame(out)
+}
+
+
+# ------------------------------------------------------------------------------
+# Percentile CI helper
+# ------------------------------------------------------------------------------
+
+percentile_ci <- function(x) {
+  unname(
+    quantile(
+      x,
+      probs = c(0.025, 0.975),
+      na.rm = TRUE
+    )
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Save a ggplot in multiple export-friendly formats
+# ------------------------------------------------------------------------------
+
+save_plot <- function(
+    plot,
+    filename,
+    width,
+    height,
+    dpi = 600) {
+  
+  ggsave(
+    file.path(figure_dir, paste0(filename, ".pdf")),
+    plot = plot,
+    width = width,
+    height = height
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Forest plot helper
+# ------------------------------------------------------------------------------
+
+forest_ratio_plot <- function(dat, xlab) {
+  
+  dat <- dat %>%
+    mutate(
+      result_label = sprintf(
+        "%.2f (%.2f-%.2f)",
+        estimate,
+        lower,
+        upper
+      )
+    )
+  
+  label_x <- max(dat$upper, na.rm = TRUE) * 1.15
+  dat$label_x <- label_x
+  
+  xmin <- min(dat$lower, na.rm = TRUE) * 0.90
+  xmax <- max(label_x * 1.55, 1.15)
+  
+  ggplot(
+    dat,
+    aes(
+      x = estimate,
+      y = method
+    )
+  ) +
+    geom_vline(
+      xintercept = 1,
+      linetype = 2,
+      linewidth = 0.5
+    ) +
+    geom_segment(
+      aes(
+        x = lower,
+        xend = upper,
+        yend = method
+      ),
+      linewidth = 0.7
+    ) +
+    geom_point(size = 2.8) +
+    geom_text(
+      aes(
+        x = label_x,
+        label = result_label
+      ),
+      hjust = 0,
+      size = 3.5
+    ) +
+    scale_x_log10() +
+    coord_cartesian(
+      xlim = c(xmin, xmax),
+      clip = "off"
+    ) +
+    labs(
+      x = xlab,
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.y = element_text(size = 11),
+      plot.margin = margin(5.5, 85, 5.5, 5.5)
+    )
+}
+
+
+# ==============================================================================
+# 3. UNADJUSTED COX MODEL
+# ==============================================================================
+
+unadj_fit <- coxph(
+  unadj_formula,
+  data = df,
+  ties = "efron", 
+  x = TRUE
+)
+
+unadj_hr <- extract_hr(unadj_fit)
+
+unadj_abs <- standardise_cox(
+  fit = unadj_fit,
+  data = df,
+  tau = tau
+)
+
+capture.output(
+  summary(unadj_fit),
+  file = file.path(model_dir, "unadjusted_cox_summary.txt")
+)
+
+write.csv(
+  as.data.frame(t(unadj_hr)),
+  file.path(table_dir, "unadjusted_cox_HR.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(t(unadj_abs)),
+  file.path(table_dir, "unadjusted_cox_standardised_3year.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 4. UNADJUSTED COX: BOOTSTRAP RR/RD
+# ==============================================================================
+
+boot_unadj <- bootstrap_standardised_cox(
+  data = df,
+  formula = unadj_formula,
+  B = B,
+  tau = tau,
+  seed = boot_seed,
+  label = "Unadjusted Cox bootstrap"
+)
+
+unadj_RR_CI <- percentile_ci(boot_unadj$RR)
+unadj_RD_CI <- percentile_ci(boot_unadj$RD)
+
+unadj_res <- tibble(
+  analysis = "Unadjusted Cox",
+  measure = c("RR", "RD"),
+  time_years = tau_years,
+  estimate = c(
+    unadj_abs["RR"],
+    unadj_abs["RD"]
+  ),
+  lower = c(
+    unadj_RR_CI[1],
+    unadj_RD_CI[1]
+  ),
+  upper = c(
+    unadj_RR_CI[2],
+    unadj_RD_CI[2]
+  )
+)
+
+write.csv(
+  boot_unadj,
+  file.path(boot_dir, "bootstrap_unadjusted_cox.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  boot_unadj,
+  file.path(boot_dir, "bootstrap_unadjusted_cox.rds")
+)
+
+write.csv(
+  unadj_res,
+  file.path(table_dir, "unadjusted_RR_RD_3year.csv"),
+  row.names = FALSE
+)
+
+#adjustedCurves 
+adjusted_curves_df <- df 
+adjusted_curves_df$empa <- factor(adjusted_curves_df$empa, levels = c(0, 1))
+
+# Same treatment-only model, with factor coding required by adjustedCurves.
+unadj_curve_fit <- coxph(
+  unadj_formula, data = adjusted_curves_df, ties = "efron", x = TRUE
+)
+
+unadj_curve <- adjustedsurv(
+  data = adjusted_curves_df, 
+  variable = "empa", 
+  ev_time = "time", 
+  event = "died", 
+  method = "direct", 
+  outcome_model = unadj_curve_fit, 
+  times = sort(unique(c(0, seq(0, tau, by = 30), tau))), 
+  conf_int=TRUE, 
+  bootstrap=TRUE, 
+  n_boot = B)
+
+unadj_curve
+
+#plot 
+p_unadj_curve <- plot(unadj_curve, cif=TRUE, conf_int=TRUE, use_boot = TRUE, conf_int_alpha=0.4)
+
+#risks
+unadj_risk_3y <- subset(unadj_curve$adj, time == tau)
+unadj_risk_3y_0 <- unadj_risk_3y$surv[unadj_risk_3y$group =="0"]
+unadj_risk_3y_1 <- unadj_risk_3y$surv[unadj_risk_3y$group =="1"]
+
+unadj_survival_3y_table <- data.frame(
+  survival_dpp4i = unadj_risk_3y_0,
+  survival_empa = unadj_risk_3y_1
+)
+
+# Save the curve and all bootstrap draws immediately.
+# Save all unadjusted_direct curve outputs and paired bootstrap contrasts.
+unadjusted_direct_point <- unadj_curve$adj %>%
+  filter(time == tau) %>%
+  transmute(group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk, names_prefix = "risk_") %>%
+  mutate(RD = risk_1 - risk_0, RR = risk_1 / risk_0)
+
+unadjusted_direct_draws <- unadj_curve$boot_data %>%
+  filter(time == tau) %>%
+  transmute(boot, group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk, names_prefix = "risk_") %>%
+  mutate(RD = risk_1 - risk_0, RR = risk_1 / risk_0)
+
+unadjusted_direct_results <- tibble()
+for (measure_name in c("risk_0", "risk_1", "RD", "RR")) {
+  draw_values <- unadjusted_direct_draws[[measure_name]]
+  valid_draws <- is.finite(draw_values)
+  limits <- if (any(valid_draws)) {
+    quantile(draw_values[valid_draws], c(0.025, 0.975), names = FALSE)
+  } else c(NA_real_, NA_real_)
+  unadjusted_direct_results <- bind_rows(unadjusted_direct_results, tibble(
+    analysis = "unadjusted_direct", measure = measure_name, time_years = tau_years,
+    estimate = unadjusted_direct_point[[measure_name]], lower = limits[1], upper = limits[2],
+    n_boot_valid = sum(valid_draws), n_boot_available = nrow(unadjusted_direct_draws)
+  ))
+}
+
+saveRDS(unadj_curve, file.path(object_dir, "unadjusted_direct_FULL_curve.rds"))
+write.csv(unadj_curve$adj, file.path(table_dir, "unadjusted_direct_survival.csv"), row.names = FALSE)
+write.csv(unadj_curve$boot_adj, file.path(table_dir, "unadjusted_direct_survival_bootstrap_CI.csv"), row.names = FALSE)
+write.csv(unadj_curve$boot_data, file.path(boot_dir, "unadjusted_direct_all_bootstrap_curves.csv"), row.names = FALSE)
+saveRDS(unadj_curve$boot_data, file.path(boot_dir, "unadjusted_direct_all_bootstrap_curves.rds"))
+write.csv(unadjusted_direct_point, file.path(table_dir, "unadjusted_direct_3year_point_estimates.csv"), row.names = FALSE)
+write.csv(unadjusted_direct_draws, file.path(boot_dir, "unadjusted_direct_3year_bootstrap_effects.csv"), row.names = FALSE)
+write.csv(unadjusted_direct_results, file.path(table_dir, "unadjusted_direct_3year_RR_RD_risks_CI.csv"), row.names = FALSE)
+save_plot(p_unadj_curve, "unadjusted_direct_cumulative_mortality_CI", 7, 5)
+
+
+# ==============================================================================
+# 5. REGRESSION-ADJUSTED COX MODEL
+# ==============================================================================
+
+adj_fit <- coxph(
+  adj_formula,
+  data = df,
+  ties = "efron", 
+  x = TRUE
+)
+
+adj_fit
+
+adj_hr <- extract_hr(adj_fit)
+
+adj_abs <- standardise_cox(
+  fit = adj_fit,
+  data = df,
+  tau = tau
+)
+
+capture.output(
+  summary(adj_fit),
+  file = file.path(model_dir, "adjusted_cox_summary.txt")
+)
+
+write.csv(
+  as.data.frame(t(adj_hr)),
+  file.path(table_dir, "adjusted_cox_HR.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(t(adj_abs)),
+  file.path(table_dir, "adjusted_cox_standardised_3year.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 6. REGRESSION-ADJUSTED COX: BOOTSTRAP RR/RD
+# ==============================================================================
+
+boot_adj <- bootstrap_standardised_cox(
+  data = df,
+  formula = adj_formula,
+  B = B,
+  tau = tau,
+  seed = boot_seed,
+  label = "Adjusted Cox bootstrap"
+)
+
+adj_RR_CI <- percentile_ci(boot_adj$RR)
+adj_RD_CI <- percentile_ci(boot_adj$RD)
+
+adj_res <- tibble(
+  analysis = "Regression adjustment",
+  measure = c("RR", "RD"),
+  time_years = tau_years,
+  estimate = c(
+    adj_abs["RR"],
+    adj_abs["RD"]
+  ),
+  lower = c(
+    adj_RR_CI[1],
+    adj_RD_CI[1]
+  ),
+  upper = c(
+    adj_RR_CI[2],
+    adj_RD_CI[2]
+  )
+)
+
+write.csv(
+  boot_adj,
+  file.path(boot_dir, "bootstrap_adjusted_cox.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  boot_adj,
+  file.path(boot_dir, "bootstrap_adjusted_cox.rds")
+)
+
+write.csv(
+  adj_res,
+
+  mutate(gform_results, analysis = "adjustedCurves direct", time_years = tau_years),
+  mutate(results_iptw, analysis = "adjustedCurves iptw_cox", time_years = tau_years),
+  file.path(table_dir, "adjusted_RR_RD_3year.csv"),
+  row.names = FALSE
+)
+
+adj_res
+
+#adjustedcurves
+adjusted_curves_df <- df 
+adjusted_curves_df$empa <- as.factor(adjusted_curves_df$empa)
+
+# Identical adjustment formula; only treatment coding differs for the API.
+gform_curve_fit <- coxph(
+  adj_formula, data = adjusted_curves_df, ties = "efron", x = TRUE
+)
+
+gform_curve <- adjustedsurv(
+  data = adjusted_curves_df, 
+  variable = "empa", 
+  ev_time = "time", 
+  event = "died", 
+  method = "direct", 
+  outcome_model = gform_curve_fit, 
+  times = sort(unique(c(0, seq(0, tau, by = 30), tau))), 
+  bootstrap=TRUE, 
+  n_boot = B)
+
+#plot 
+p_gform_curve <- plot(gform_curve, cif=TRUE, conf_int=TRUE, use_boot = TRUE, conf_int_alpha=0.4)
+
+#risks
+gform_risk_3y <- subset(gform_curve$adj, time == tau)
+gform_risk_3y_0 <- gform_risk_3y$surv[gform_risk_3y$group =="0"]
+gform_risk_3y_1 <- gform_risk_3y$surv[gform_risk_3y$group =="1"]
+
+gform_risk_table <- gform_curve$boot_adj %>%
+  filter(time == tau) %>%
+  transmute(
+    treatment = ifelse(group == "0", "DPP-4i", "Empagliflozin"),
+    risk = 1 - surv,
+    lower = 1 - ci_upper,
+    upper = 1 - ci_lower,
+    `3-year risk (95% CI)` = sprintf(
+      "%.1f%% (%.1f–%.1f%%)",
+      100 * risk,
+      100 * lower,
+      100 * upper
+    )
+  )
+
+# Point estimates from the original fitted curves
+gform_point <- gform_curve$adj %>%
+  filter(time == tau) %>%
+  transmute(group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk,
+              names_prefix = "risk_") %>%
+  mutate(
+    RD = risk_1 - risk_0,
+    RR = risk_1 / risk_0
+  )
+
+# Calculate both contrasts within each bootstrap sample
+gform_boot_effects <- gform_curve$boot_data %>%
+  filter(time == tau) %>%
+  transmute(boot, group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk,
+              names_prefix = "risk_") %>%
+  mutate(
+    RD = risk_1 - risk_0,
+    RR = risk_1 / risk_0
+  )
+
+# Estimates and percentile 95% confidence intervals
+gform_results <- tibble(
+  measure = c("RD", "RR"),
+  estimate = c(gform_point$RD, gform_point$RR),
+  lower = c(
+    quantile(gform_boot_effects$RD, 0.025, na.rm = TRUE),
+    quantile(gform_boot_effects$RR, 0.025, na.rm = TRUE)
+  ),
+  upper = c(
+    quantile(gform_boot_effects$RD, 0.975, na.rm = TRUE),
+    quantile(gform_boot_effects$RR, 0.975, na.rm = TRUE)
+  )
+)
+
+# Save all adjusted_direct curve outputs and paired bootstrap contrasts.
+adjusted_direct_point <- gform_curve$adj %>%
+  filter(time == tau) %>%
+  transmute(group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk, names_prefix = "risk_") %>%
+  mutate(RD = risk_1 - risk_0, RR = risk_1 / risk_0)
+
+adjusted_direct_draws <- gform_curve$boot_data %>%
+  filter(time == tau) %>%
+  transmute(boot, group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk, names_prefix = "risk_") %>%
+  mutate(RD = risk_1 - risk_0, RR = risk_1 / risk_0)
+
+adjusted_direct_results <- tibble()
+for (measure_name in c("risk_0", "risk_1", "RD", "RR")) {
+  draw_values <- adjusted_direct_draws[[measure_name]]
+  valid_draws <- is.finite(draw_values)
+  limits <- if (any(valid_draws)) {
+    quantile(draw_values[valid_draws], c(0.025, 0.975), names = FALSE)
+  } else c(NA_real_, NA_real_)
+  adjusted_direct_results <- bind_rows(adjusted_direct_results, tibble(
+    analysis = "adjusted_direct", measure = measure_name, time_years = tau_years,
+    estimate = adjusted_direct_point[[measure_name]], lower = limits[1], upper = limits[2],
+    n_boot_valid = sum(valid_draws), n_boot_available = nrow(adjusted_direct_draws)
+  ))
+}
+
+saveRDS(gform_curve, file.path(object_dir, "adjusted_direct_FULL_curve.rds"))
+write.csv(gform_curve$adj, file.path(table_dir, "adjusted_direct_survival.csv"), row.names = FALSE)
+write.csv(gform_curve$boot_adj, file.path(table_dir, "adjusted_direct_survival_bootstrap_CI.csv"), row.names = FALSE)
+write.csv(gform_curve$boot_data, file.path(boot_dir, "adjusted_direct_all_bootstrap_curves.csv"), row.names = FALSE)
+saveRDS(gform_curve$boot_data, file.path(boot_dir, "adjusted_direct_all_bootstrap_curves.rds"))
+write.csv(adjusted_direct_point, file.path(table_dir, "adjusted_direct_3year_point_estimates.csv"), row.names = FALSE)
+write.csv(adjusted_direct_draws, file.path(boot_dir, "adjusted_direct_3year_bootstrap_effects.csv"), row.names = FALSE)
+write.csv(adjusted_direct_results, file.path(table_dir, "adjusted_direct_3year_RR_RD_risks_CI.csv"), row.names = FALSE)
+save_plot(p_gform_curve, "adjusted_direct_cumulative_mortality_CI", 7, 5)
+
+
+# ==============================================================================
+# 7. IPTW
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Propensity-score denominator model
+# ------------------------------------------------------------------------------
+
+ps_denom_formula <- empa ~
+  # Demographics
+  male +
+  cohort_year_recoded +
+  age_at_initiation +
+  I(age_at_initiation^2) +
+  
+  # Other baseline covariates
+  completed_eth_recoded +
+  mi_eth_recoded +
+  
+  completed_smoking_status +
+  mi_smoking_status +
+  
+  completed_sbp_at_initiation +
+  mi_sbp_at_initiation +
+  
+  completed_bmi_at_initiation +
+  I(completed_bmi_at_initiation^2) +
+  mi_bmi_at_initiation +
+  
+  # HbA1c: quadratic + cohort-year interaction
+  completed_hba1c_at_initiation +
+  I(completed_hba1c_at_initiation^2) +
+  mi_hba1c_at_initiation +
+  
+  completed_hba1c_at_initiation:cohort_year_recoded +
+  I(completed_hba1c_at_initiation^2):cohort_year_recoded +
+  mi_hba1c_at_initiation:cohort_year_recoded +
+  
+  # Lipids
+  completed_ldl_at_initiation +
+  I(completed_ldl_at_initiation^2) +
+  mi_ldl_at_initiation +
+  
+  completed_hdl_at_initiation +
+  I(completed_hdl_at_initiation^2) +
+  mi_hdl_at_initiation +
+  
+  # eGFR: spline + interactions
+  ns(completed_egfr_at_initiation, df = 4) +
+  mi_egfr_at_initiation +
+  
+  ns(completed_egfr_at_initiation, df = 4):cohort_year_recoded +
+  mi_egfr_at_initiation:cohort_year_recoded +
+  
+  ns(completed_egfr_at_initiation, df = 4):male +
+  ns(completed_egfr_at_initiation, df = 4):age_at_initiation +
+  
+  # Medication / treatment history
+  su_before_initiation +
+  metformin_monotherapy_before_initiation +
+  lipid_lowering_before_initiation +
+  anti_htn_before_initiation +
+  glp1ra_before_initiation +
+  anti_platelet_before_initiation +
+  anticoag_before_initiation +
+  insulin_before_initiation +
+  
+  # Medication x cohort-year interactions
+  su_before_initiation:cohort_year_recoded +
+  metformin_monotherapy_before_initiation:cohort_year_recoded +
+  lipid_lowering_before_initiation:cohort_year_recoded +
+  anti_htn_before_initiation:cohort_year_recoded +
+  glp1ra_before_initiation:cohort_year_recoded +
+  anti_platelet_before_initiation:cohort_year_recoded +
+  anticoag_before_initiation:cohort_year_recoded +
+  insulin_before_initiation:cohort_year_recoded +
+  
+  # Comorbidities
+  hf +
+  smi +
+  copd +
+  ra +
+  asthma +
+  epilepsy +
+  dementia +
+  ibd +
+  liver +
+  imd_quintile +
+  cancer_diagnosis_5y_before_cohort
+
+
+ps_denom_fit <- glm(
+  ps_denom_formula,
+  family = binomial(link = "logit"),
+  data = df
+)
+
+df$ps_denom <- predict(
+  ps_denom_fit,
+  newdata = df,
+  type = "response"
+)
+
+
+# ------------------------------------------------------------------------------
+# Propensity-score numerator model
+# Marginal P(A) for stabilised ATE weights
+# ------------------------------------------------------------------------------
+
+ps_num_fit <- glm(
+  empa ~ 1,
+  family = binomial(link = "logit"),
+  data = df
+)
+
+df$ps_num <- predict(
+  ps_num_fit,
+  newdata = df,
+  type = "response"
+)
+
+
+# ------------------------------------------------------------------------------
+# Stabilised ATE weights
+# ------------------------------------------------------------------------------
+
+df <- df %>%
+  mutate(
+    sw_a = ifelse(
+      empa == 1,
+      ps_num / ps_denom,
+      (1 - ps_num) / (1 - ps_denom)
+    )
+  )
+
+q99 <- unname(
+  quantile(
+    df$sw_a,
+    probs = 0.99,
+    na.rm = TRUE
+  )
+)
+
+df <- df %>%
+  mutate(
+    sw_a_t = pmin(sw_a, q99)
+  )
+
+
+# ------------------------------------------------------------------------------
+# Save PS and weight diagnostics
+# ------------------------------------------------------------------------------
+
+ps_weight_summary <- df %>%
+  group_by(empa) %>%
+  summarise(
+    n = n(),
+    ps_mean = mean(ps_denom, na.rm = TRUE),
+    ps_sd = sd(ps_denom, na.rm = TRUE),
+    ps_min = min(ps_denom, na.rm = TRUE),
+    ps_p01 = quantile(ps_denom, 0.01, na.rm = TRUE),
+    ps_p05 = quantile(ps_denom, 0.05, na.rm = TRUE),
+    ps_median = median(ps_denom, na.rm = TRUE),
+    ps_p95 = quantile(ps_denom, 0.95, na.rm = TRUE),
+    ps_p99 = quantile(ps_denom, 0.99, na.rm = TRUE),
+    ps_max = max(ps_denom, na.rm = TRUE),
+    weight_mean_raw = mean(sw_a, na.rm = TRUE),
+    weight_sd_raw = sd(sw_a, na.rm = TRUE),
+    weight_median_raw = median(sw_a, na.rm = TRUE),
+    weight_p95_raw = quantile(sw_a, 0.95, na.rm = TRUE),
+    weight_p99_raw = quantile(sw_a, 0.99, na.rm = TRUE),
+    weight_max_raw = max(sw_a, na.rm = TRUE),
+    weight_mean_truncated = mean(sw_a_t, na.rm = TRUE),
+    weight_sd_truncated = sd(sw_a_t, na.rm = TRUE),
+    weight_median_truncated = median(sw_a_t, na.rm = TRUE),
+    weight_p95_truncated = quantile(sw_a_t, 0.95, na.rm = TRUE),
+    weight_p99_truncated = quantile(sw_a_t, 0.99, na.rm = TRUE),
+    weight_max_truncated = max(sw_a_t, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+weight_percentiles <- tibble(
+  percentile = c(
+    "Min", "1%", "5%", "25%", "50%",
+    "75%", "95%", "99%", "Max"
+  ),
+  raw_weight = as.numeric(
+    quantile(
+      df$sw_a,
+      probs = c(0, .01, .05, .25, .50, .75, .95, .99, 1),
+      na.rm = TRUE
+    )
+  ),
+  truncated_weight = as.numeric(
+    quantile(
+      df$sw_a_t,
+      probs = c(0, .01, .05, .25, .50, .75, .95, .99, 1),
+      na.rm = TRUE
+    )
+  )
+)
+
+write.csv(
+  ps_weight_summary,
+  file.path(table_dir, "propensity_score_and_weight_summary_by_treatment.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  weight_percentiles,
+  file.path(table_dir, "iptw_weight_percentiles.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  df %>%
+    select(empa, ps_denom, ps_num, sw_a, sw_a_t),
+  file.path(table_dir, "individual_propensity_scores_and_weights.csv"),
+  row.names = FALSE
+)
+
+capture.output(
+  summary(ps_denom_fit),
+  file = file.path(model_dir, "propensity_score_denominator_model_summary.txt")
+)
+
+capture.output(
+  summary(ps_num_fit),
+  file = file.path(model_dir, "propensity_score_numerator_model_summary.txt")
+)
+
+
+# ==============================================================================
+# 8. IPTW HISTOGRAMS / OVERLAP DIAGNOSTICS
+# ==============================================================================
+
+plot_df <- df %>%
+  mutate(
+    treatment = factor(
+      empa,
+      levels = c(0, 1),
+      labels = c("DPP-4i", "Empagliflozin")
+    )
+  )
+
+
+# ------------------------------------------------------------------------------
+# Propensity-score overlap
+# ------------------------------------------------------------------------------
+
+p_ps <- ggplot(
+  plot_df,
+  aes(
+    x = ps_denom,
+    fill = treatment
+  )
+) +
+  geom_histogram(
+    bins = 50,
+    position = "identity",
+    alpha = 0.45
+  ) +
+  labs(
+    x = "Estimated propensity score",
+    y = "Count",
+    fill = "Treatment"
+  ) +
+  theme_classic(base_size = 12)
+
+save_plot(
+  p_ps,
+  "IPTW_propensity_score_overlap",
+  width = 7,
+  height = 5
+)
+
+# ------------------------------------------------------------------------------
+# Raw IPTW distribution
+# ------------------------------------------------------------------------------
+
+p_w_raw <- ggplot(
+  plot_df,
+  aes(x = sw_a)
+) +
+  geom_histogram(
+    bins = 60
+  ) +
+  labs(
+    x = "Raw stabilised IPTW",
+    y = "Count"
+  ) +
+  theme_classic(base_size = 12)
+
+save_plot(
+  p_w_raw,
+  "IPTW_raw_weight_histogram",
+  width = 7,
+  height = 5
+)
+
+# ------------------------------------------------------------------------------
+# Truncated IPTW distribution
+# ------------------------------------------------------------------------------
+
+p_w_trunc <- ggplot(
+  plot_df,
+  aes(x = sw_a_t)
+) +
+  geom_histogram(
+    bins = 60
+  ) +
+  labs(
+    x = "Truncated stabilised IPTW",
+    y = "Count"
+  ) +
+  theme_classic(base_size = 12)
+
+save_plot(
+  p_w_trunc,
+  "IPTW_truncated_weight_histogram",
+  width = 7,
+  height = 5
+)
+
+
+# ------------------------------------------------------------------------------
+# Raw vs truncated weights
+# ------------------------------------------------------------------------------
+
+weight_long <- bind_rows(
+  tibble(
+    weight = df$sw_a,
+    version = "Raw"
+  ),
+  tibble(
+    weight = df$sw_a_t,
+    version = "Truncated at 99th percentile"
+  )
+)
+
+p_weight_compare <- ggplot(
+  weight_long,
+  aes(
+    x = weight,
+    fill = version
+  )
+) +
+  geom_histogram(
+    bins = 60,
+    position = "identity",
+    alpha = 0.45
+  ) +
+  coord_cartesian(
+    xlim = c(0, q99 * 1.05)
+  ) +
+  labs(
+    x = "Stabilised IPTW",
+    y = "Count",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 12)
+
+save_plot(
+  p_weight_compare,
+  "IPTW_raw_vs_truncated_weight_histogram",
+  width = 7,
+  height = 5
+)
+
+
+# ==============================================================================
+# 9. COVARIATE BALANCE: SMD + LOVE PLOT
+# ==============================================================================
+
+ps_covariates <- unique(
+  all.vars(
+    delete.response(
+      terms(ps_denom_fit)
+    )
+  )
+)
+
+covs_df <- df %>%
+  select(all_of(ps_covariates))
+
+bal_iptw <- bal.tab(
+  x = covs_df,
+  treat = df$empa,
+  weights = df$sw_a_t,
+  method = "weighting",
+  estimand = "ATE",
+  un = TRUE,
+  s.d.denom = "pooled"
+)
+
+capture.output(
+  bal_iptw,
+  file = file.path(model_dir, "IPTW_balance_full_output.txt")
+)
+
+smd_table <- as.data.frame(bal_iptw$Balance) %>%
+  rownames_to_column("covariate")
+
+write.csv(
+  smd_table,
+  file.path(table_dir, "IPTW_standardised_mean_differences.csv"),
+  row.names = FALSE
+)
+
+# Summary of balance before/after weighting
+if (all(c("Diff.Un", "Diff.Adj") %in% names(smd_table))) {
+  
+  smd_summary <- tibble(
+    n_balance_terms = nrow(smd_table),
+    max_abs_SMD_unweighted = max(
+      abs(smd_table$Diff.Un),
+      na.rm = TRUE
+    ),
+    max_abs_SMD_weighted = max(
+      abs(smd_table$Diff.Adj),
+      na.rm = TRUE
+    ),
+    n_abs_SMD_unweighted_gt_0_10 = sum(
+      abs(smd_table$Diff.Un) > 0.10,
+      na.rm = TRUE
+    ),
+    n_abs_SMD_weighted_gt_0_10 = sum(
+      abs(smd_table$Diff.Adj) > 0.10,
+      na.rm = TRUE
+    )
+  )
+  
+  write.csv(
+    smd_summary,
+    file.path(table_dir, "IPTW_SMD_summary.csv"),
+    row.names = FALSE
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Love plot
+# ------------------------------------------------------------------------------
+
+p_love <- love.plot(
+  bal_iptw,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  sample.names = c("Unweighted", "IPTW"),
+  shapes = c(16, 17),
+  size = 3,
+  line = FALSE
+)
+
+save_plot(
+  p_love,
+  "IPTW_love_plot",
+  width = 8,
+  height = 9
+)
+
+
+# ==============================================================================
+# 10. WEIGHTED MARGINAL COX MODEL
+# ==============================================================================
+
+iptw_fit <- coxph(
+  Surv(time, died) ~ empa,
+  data = df,
+  weights = sw_a_t,
+  robust = TRUE,
+  ties = "efron", 
+  x=TRUE
+)
+
+iptw_hr <- extract_hr(iptw_fit)
+
+capture.output(
+  summary(iptw_fit),
+  file = file.path(model_dir, "IPTW_weighted_cox_summary.txt")
+)
+
+write.csv(
+  as.data.frame(t(iptw_hr)),
+  file.path(table_dir, "IPTW_weighted_cox_HR.csv"),
+  row.names = FALSE
+)
+iptw_hr
+
+#adjusted curves
+iptw_data <- df
+iptw_data$empa <- factor(iptw_data$empa, levels = c(0, 1))
+
+# Propensity-score model: use your existing confounder specification
+iptw_ps_fit <- glm(
+  ps_denom_formula,
+  data = iptw_data,
+  family = binomial()
+)
+
+# IPTW curves with bootstrap confidence intervals
+curve_iptw <- adjustedsurv(
+  data = iptw_data,
+  variable = "empa",
+  ev_time = "time",
+  event = "died",
+  method = "iptw_cox",
+  treatment_model = ps_denom_fit,
+  stabilize = TRUE,
+  trim_quantiles = c(0.001, 0.999),
+  times = sort(unique(c(0, seq(0, tau, by = 30), tau))),
+  bootstrap = TRUE,
+  n_boot = 100
+)
+
+# Plot cumulative mortality with bootstrap CIs
+p_iptw_curve <- plot(
+  curve_iptw,
+  cif = TRUE,
+  conf_int = TRUE,
+  use_boot = TRUE,
+  conf_int_alpha = 0.4
+)
+
+# Original-sample 3-year risks and effect estimates
+iptw_point <- curve_iptw$adj %>%
+  filter(time == tau) %>%
+  transmute(group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(
+    names_from = group,
+    values_from = risk,
+    names_prefix = "risk_"
+  ) %>%
+  mutate(
+    RD = risk_1 - risk_0,
+    RR = risk_1 / risk_0
+  )
+
+# Calculate RD and RR separately within each bootstrap replicate
+iptw_boot_effects <- curve_iptw$boot_data %>%
+  filter(time == tau) %>%
+  transmute(boot, group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(
+    names_from = group,
+    values_from = risk,
+    names_prefix = "risk_"
+  ) %>%
+  mutate(
+    RD = risk_1 - risk_0,
+    RR = risk_1 / risk_0
+  )
+
+# Percentile 95% CIs
+results_iptw <- tibble(
+  measure = c("RD", "RR"),
+  estimate = c(iptw_point$RD, iptw_point$RR),
+  lower = c(
+    quantile(iptw_boot_effects$RD, 0.025, na.rm = TRUE),
+    quantile(iptw_boot_effects$RR, 0.025, na.rm = TRUE)
+  ),
+  upper = c(
+    quantile(iptw_boot_effects$RD, 0.975, na.rm = TRUE),
+    quantile(iptw_boot_effects$RR, 0.975, na.rm = TRUE)
+  )
+)
+
+# Save all iptw_cox curve outputs and paired bootstrap contrasts.
+iptw_cox_point <- curve_iptw$adj %>%
+  filter(time == tau) %>%
+  transmute(group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk, names_prefix = "risk_") %>%
+  mutate(RD = risk_1 - risk_0, RR = risk_1 / risk_0)
+
+iptw_cox_draws <- curve_iptw$boot_data %>%
+  filter(time == tau) %>%
+  transmute(boot, group = as.character(group), risk = 1 - surv) %>%
+  pivot_wider(names_from = group, values_from = risk, names_prefix = "risk_") %>%
+  mutate(RD = risk_1 - risk_0, RR = risk_1 / risk_0)
+
+iptw_cox_results <- tibble()
+for (measure_name in c("risk_0", "risk_1", "RD", "RR")) {
+  draw_values <- iptw_cox_draws[[measure_name]]
+  valid_draws <- is.finite(draw_values)
+  limits <- if (any(valid_draws)) {
+    quantile(draw_values[valid_draws], c(0.025, 0.975), names = FALSE)
+  } else c(NA_real_, NA_real_)
+  iptw_cox_results <- bind_rows(iptw_cox_results, tibble(
+    analysis = "iptw_cox", measure = measure_name, time_years = tau_years,
+    estimate = iptw_cox_point[[measure_name]], lower = limits[1], upper = limits[2],
+    n_boot_valid = sum(valid_draws), n_boot_available = nrow(iptw_cox_draws)
+  ))
+}
+
+saveRDS(curve_iptw, file.path(object_dir, "iptw_cox_FULL_curve.rds"))
+write.csv(curve_iptw$adj, file.path(table_dir, "iptw_cox_survival.csv"), row.names = FALSE)
+write.csv(curve_iptw$boot_adj, file.path(table_dir, "iptw_cox_survival_bootstrap_CI.csv"), row.names = FALSE)
+write.csv(curve_iptw$boot_data, file.path(boot_dir, "iptw_cox_all_bootstrap_curves.csv"), row.names = FALSE)
+saveRDS(curve_iptw$boot_data, file.path(boot_dir, "iptw_cox_all_bootstrap_curves.rds"))
+write.csv(iptw_cox_point, file.path(table_dir, "iptw_cox_3year_point_estimates.csv"), row.names = FALSE)
+write.csv(iptw_cox_draws, file.path(boot_dir, "iptw_cox_3year_bootstrap_effects.csv"), row.names = FALSE)
+write.csv(iptw_cox_results, file.path(table_dir, "iptw_cox_3year_RR_RD_risks_CI.csv"), row.names = FALSE)
+save_plot(p_iptw_curve, "iptw_cox_cumulative_mortality_CI", 7, 5)
+
+
+### Graph cumulative incidence curves 
+
+curves <- bind_rows(
+  mutate(gform_curve$adj, method = "Adjusted Cox"),
+  mutate(curve_iptw$adj, method = "IPTW Cox")
+) %>%
+  mutate(
+    years = time / 365.25,
+    risk = 1 - surv,
+    treatment = factor(
+      group,
+      levels = c("0", "1"),
+      labels = c("DPP-4 inhibitor", "Empagliflozin")
+    )
+  )
+
+# Bootstrap confidence intervals
+bands <- bind_rows(
+  mutate(gform_curve$boot_adj, method = "Adjusted Cox"),
+  mutate(curve_iptw$boot_adj, method = "IPTW Cox")
+) %>%
+  mutate(
+    years = time / 365.25,
+    risk_lower = 1 - ci_upper,
+    risk_upper = 1 - ci_lower,
+    treatment = factor(
+      group,
+      levels = c("0", "1"),
+      labels = c("DPP-4 inhibitor", "Empagliflozin")
+    )
+  )
+
+p <- ggplot() +
+  geom_ribbon(
+    data = bands,
+    aes(
+      x = years,
+      ymin = risk_lower,
+      ymax = risk_upper,
+      fill = treatment,
+      group = interaction(treatment, method)
+    ),
+    alpha = 0.12
+  ) +
+  geom_step(
+    data = curves,
+    aes(
+      x = years,
+      y = risk,
+      colour = treatment,
+      linetype = method,
+      group = interaction(treatment, method)
+    ),
+    linewidth = 0.8
+  ) +
+  scale_colour_manual(values = c("#444444", "#0072B2")) +
+  scale_fill_manual(values = c("#444444", "#0072B2")) +
+  scale_linetype_manual(
+    values = c("Adjusted Cox" = "solid", "IPTW Cox" = "dashed")
+  ) +
+  scale_x_continuous(breaks = 0:3) +
+  coord_cartesian(xlim = c(0, 3), ylim = c(0, 1)) +
+  labs(
+    x = "Time since initiation (years)",
+    y = "Cumulative mortality risk",
+    colour = "Treatment",
+    fill = "Treatment",
+    linetype = "Method"
+  ) +
+  theme_classic(base_size = 12)
+
+p
+save_plot(p, "Adjusted_Cox_vs_IPTW_Cox_cumulative_mortality", 8, 5)
+
+# ==============================================================================
+# 11. COMBINED EFFECT-ESTIMATE TABLE
+# ==============================================================================
+
+effect_results <- bind_rows(
+  
+  tibble(
+    analysis = "Unadjusted Cox",
+    measure = "HR",
+    time_years = NA_real_,
+    estimate = unadj_hr["estimate"],
+    lower = unadj_hr["lower"],
+    upper = unadj_hr["upper"]
+  ),
+  
+  unadj_res,
+  
+  tibble(
+    analysis = "Regression adjustment",
+    measure = "HR",
+    time_years = NA_real_,
+    estimate = adj_hr["estimate"],
+    lower = adj_hr["lower"],
+    upper = adj_hr["upper"]
+  ),
+  
+  adj_res,
+  
+  tibble(
+    analysis = "IPTW",
+    measure = "HR",
+    time_years = NA_real_,
+    estimate = iptw_hr["estimate"],
+    lower = iptw_hr["lower"],
+    upper = iptw_hr["upper"]
+  )
+)
+
+write.csv(
+  effect_results,
+  file.path(table_dir, "effect_estimates_all.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  effect_results,
+  file.path(object_dir, "effect_estimates_all.rds")
+)
+
+
+# ==============================================================================
+# 12. PROPORTIONAL-HAZARDS DIAGNOSTICS
+# ==============================================================================
+
+ph_test <- cox.zph(adj_fit)
+
+capture.output(
+  ph_test,
+  file = file.path(model_dir, "adjusted_cox_schoenfeld_test.txt")
+)
+
+ph_table <- as.data.frame(ph_test$table) %>%
+  rownames_to_column("term")
+
+write.csv(
+  ph_table,
+  file.path(table_dir, "adjusted_cox_schoenfeld_test.csv"),
+  row.names = FALSE
+)
+
+# PNG
+png(
+  filename = file.path(
+    figure_dir,
+    "adjusted_cox_schoenfeld_empa.png"
+  ),
+  width = 1800,
+  height = 1400,
+  res = 200
+)
+
+plot(
+  ph_test,
+  var = "empa",
+  resid = TRUE,
+  se = TRUE,
+  xlab = "Time",
+  ylab = "Scaled Schoenfeld residuals"
+)
+
+abline(
+  h = 0,
+  lty = 2,
+  col = "grey40"
+)
+
+title("PH assessment for empagliflozin")
+
+dev.off()
+
+# PDF
+pdf(
+  file = file.path(
+    figure_dir,
+    "adjusted_cox_schoenfeld_empa.pdf"
+  ),
+  width = 7,
+  height = 5
+)
+
+plot(
+  ph_test,
+  var = "empa",
+  resid = TRUE,
+  se = TRUE,
+  xlab = "Time",
+  ylab = "Scaled Schoenfeld residuals"
+)
+
+abline(
+  h = 0,
+  lty = 2,
+  col = "grey40"
+)
+
+title("PH assessment for empagliflozin")
+
+dev.off()
+

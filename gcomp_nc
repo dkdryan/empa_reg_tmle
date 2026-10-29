@@ -1,0 +1,176 @@
+# ==============================================================================
+# Construct cumulative incidence curves for mortality under observed treatment strategy
+# ==============================================================================
+
+library(survival)
+library(riskRegression)
+library(ggplot2)
+
+# ==============================================================================
+# 1. Import data
+# ==============================================================================
+
+setwd("")
+
+df <- read.csv("mdi_regular.csv")
+
+df$empa <- as.integer(as.character(df$empa))
+
+# ==============================================================================
+# 2. Define adjustment variables
+# ==============================================================================
+
+adjustment_terms <- c(
+  "male",
+  "cohort_year_recoded",
+  "age_at_initiation",
+  "completed_eth_recoded", "mi_eth_recoded",
+  "completed_smoking_status", "mi_smoking_status",
+  "completed_sbp_at_initiation", "mi_sbp_at_initiation",
+  "completed_bmi_at_initiation", "mi_bmi_at_initiation",
+  "completed_hba1c_at_initiation", "mi_hba1c_at_initiation",
+  "completed_ldl_at_initiation", "mi_ldl_at_initiation",
+  "completed_hdl_at_initiation", "mi_hdl_at_initiation",
+  "completed_egfr_at_initiation", "mi_egfr_at_initiation",
+  "su_before_initiation",
+  "metformin_monotherapy_before_initiation",
+  "lipid_lowering_before_initiation",
+  "anti_htn_before_initiation",
+  "glp1ra_before_initiation",
+  "anti_platelet_before_initiation",
+  "anticoag_before_initiation",
+  "insulin_before_initiation",
+  "hf", "smi", "copd", "ra", "asthma",
+  "epilepsy", "dementia", "ibd", "liver",
+  "imd_quintile",
+  "cancer_diagnosis_5y_before_cohort"
+)
+
+continuous_vars <- c(
+  "age_at_initiation",
+  "completed_sbp_at_initiation",
+  "completed_bmi_at_initiation",
+  "completed_hba1c_at_initiation",
+  "completed_ldl_at_initiation",
+  "completed_hdl_at_initiation",
+  "completed_egfr_at_initiation"
+)
+
+factor_vars <- setdiff(adjustment_terms, continuous_vars)
+
+df[factor_vars] <- lapply(df[factor_vars], factor)
+
+# ==============================================================================
+# 3. Fit regression-adjusted Cox model
+# ==============================================================================
+
+adj_formula <- as.formula(
+  paste(
+    "Surv(time, died) ~ empa +",
+    paste(adjustment_terms, collapse = " + ")
+  )
+)
+
+# Ensure fitting and prediction use the same analysis population
+model_vars <- all.vars(adj_formula)
+df <- df[complete.cases(df[, model_vars]), ]
+
+stopifnot(all(df$empa %in% c(0L, 1L)))
+
+adj_fit <- coxph(
+  adj_formula,
+  data = df,
+  ties = "efron",
+  x = TRUE,
+  y = TRUE
+)
+
+# ==============================================================================
+# 4. Predict natural-course mortality risks
+# ==============================================================================
+
+# Follow-up is measured in days
+years <- seq(0, 3, by = 0.25)
+
+# Keep everyone's observed treatment and covariates unchanged
+individual_risks <- predictRisk(
+  adj_fit,
+  newdata = df,
+  times = years * 365.25
+)
+
+# Average predictions overall and within observed treatment groups
+nc_res <- rbind(
+  data.frame(
+    year = years,
+    risk = colMeans(individual_risks),
+    group = "Overall"
+  ),
+  data.frame(
+    year = years,
+    risk = colMeans(
+      individual_risks[df$empa == 1L, , drop = FALSE]
+    ),
+    group = "Empagliflozin"
+  ),
+  data.frame(
+    year = years,
+    risk = colMeans(
+      individual_risks[df$empa == 0L, , drop = FALSE]
+    ),
+    group = "DPP-4i"
+  )
+)
+
+# Three-year natural-course risks
+nc_res[nc_res$year == 3, ]
+
+# ==============================================================================
+# 5. Save results
+# ==============================================================================
+
+write.csv(
+  nc_res,
+  "nc_gcomputation.csv",
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 6. Plot natural-course mortality
+# ==============================================================================
+
+p <- ggplot(
+  nc_res,
+  aes(x = year, y = risk, colour = group)
+) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(
+    breaks = seq(0, 3, by = 0.5),
+    limits = c(0, 3)
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  labs(
+    x = "Years",
+    y = "Cumulative mortality risk",
+    colour = NULL,
+    title = "Natural-course mortality from g-computation"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+p
+
+ggsave(
+  "nc_gcomputation.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)

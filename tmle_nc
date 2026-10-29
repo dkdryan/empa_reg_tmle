@@ -1,0 +1,1871 @@
+# ==============================================================================
+# MDI NATURAL-COURSE TMLE: lmtp_survival WITH PARAMETRIC GLM AND SUPER LEARNER 
+# ==============================================================================
+#
+# INPUT:
+#   example: mdi_lmtp_wide_3month.csv
+#
+# RUNS:
+#   1. Natural course: Parametric GLM + truncation at 99.9th percentile 
+#   2. Natural course: Super Learner  + truncation at 99.9th percentile 
+#
+# Natural course is estimated with:
+#   lmtp_survival(..., trt = "empa", shift = NULL, mtp = FALSE,
+#                 estimator = "lmtp_tmle")
+#
+# Super Learner library:
+#   SL.mean
+#   SL.glm
+#   SL.ranger
+#   SL.rpart
+#   SL.glmnet.ridge
+#
+# CV:
+#   nuisance-function CV = 5
+#
+# For HPC 
+#
+# ==============================================================================
+
+
+# ==============================================================================
+# 0. PACKAGES 
+# ==============================================================================
+#
+# IMPORTANT:
+#
+# ==============================================================================
+library(lmtp)
+library(SuperLearner)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(progressr)
+options(
+  scipen = 999,
+  warn = 1
+)
+
+# ==============================================================================
+# 1. USER SETTINGS
+# ==============================================================================
+
+setwd(PROJECT_DIR)
+
+# Optional command-line arguments:
+#   Rscript mdi_analysis.R <data_file.csv> "<analysis label>"
+args <- commandArgs(trailingOnly = TRUE)
+
+DATA_FILE <- if (length(args) >= 1 && nzchar(args[1])) {
+  args[1]
+} else {
+  "mdi_lmtp_wide_3month.csv"
+}
+
+ANALYSIS_LABEL <- if (length(args) >= 2 && nzchar(args[2])) {
+  args[2]
+} else {
+  "3 monthly"
+}
+
+if (!file.exists(DATA_FILE)) {
+  stop(
+    "Input data file not found: ",
+    file.path(PROJECT_DIR, DATA_FILE),
+    "\nFiles in submission directory:\n",
+    paste(list.files(PROJECT_DIR), collapse = "\n")
+  )
+}
+
+message("Project directory: ", PROJECT_DIR)
+message("Input data file: ", DATA_FILE)
+message("Analysis label: ", ANALYSIS_LABEL)
+
+
+# ------------------------------------------------------------------------------
+# CV = 5 throughout
+# ------------------------------------------------------------------------------
+
+TMLE_FOLDS <- 5L
+NUISANCE_FOLDS <- 5L
+SEED <- 3001L
+
+
+# ------------------------------------------------------------------------------
+# TRUNCATION
+#
+# lmtp default:
+#   .trim = 0.999 -> trim DR values above the 99.9th percentile
+# ------------------------------------------------------------------------------
+
+TRIM_Y <- 0.999
+
+
+# ------------------------------------------------------------------------------
+# Output
+# ------------------------------------------------------------------------------
+
+job_id <- Sys.getenv("JOB_ID", unset = "")
+run_stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+run_tag <- if (nzchar(job_id)) {
+  paste0("job_", job_id, "_", run_stamp)
+} else {
+  paste0("local_", run_stamp)
+}
+
+OUTPUT_DIR <- file.path(
+  PROJECT_DIR,
+  paste0(
+    tools::file_path_sans_ext(basename(DATA_FILE)),
+    "_natural_course_2run_",
+    run_tag
+  )
+)
+
+dir.create(
+  OUTPUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+writeLines(
+  c(
+    paste0("job_id=", ifelse(nzchar(job_id), job_id, "NA")),
+    paste0("host=", Sys.info()[["nodename"]]),
+    paste0("started=", as.character(Sys.time())),
+    paste0("project_dir=", PROJECT_DIR),
+    paste0("data_file=", DATA_FILE),
+    paste0("analysis_label=", ANALYSIS_LABEL),
+    paste0("R_version=", R.version.string),
+    paste0("user_library=", LOCAL_R_LIB)
+  ),
+  con = file.path(OUTPUT_DIR, "JOB_MANIFEST.txt")
+)
+
+message("Output directory: ", OUTPUT_DIR)
+
+
+# ==============================================================================
+# 2. IMPORT THE WIDE DATASET
+# ==============================================================================
+
+df <- read.csv(
+  DATA_FILE,
+  check.names = FALSE
+)
+
+
+# ==============================================================================
+# 3. IDENTIFY TIME-POINT VARIABLES AUTOMATICALLY
+# ==============================================================================
+
+get_suffix_number <- function(x) {
+  as.integer(
+    sub(
+      ".*_",
+      "",
+      x
+    )
+  )
+}
+
+
+outcome_vars <- grep(
+  "^died_kplus1_[0-9]+$",
+  names(df),
+  value = TRUE
+)
+
+censor_vars <- grep(
+  "^c_kplus1_[0-9]+$",
+  names(df),
+  value = TRUE
+)
+
+
+outcome_vars <- outcome_vars[
+  order(
+    get_suffix_number(outcome_vars)
+  )
+]
+
+censor_vars <- censor_vars[
+  order(
+    get_suffix_number(censor_vars)
+  )
+]
+
+K <- length(outcome_vars)
+
+message(
+  "Detected ",
+  K,
+  " time points."
+)
+
+message(
+  "Outcome variables: ",
+  paste(
+    outcome_vars,
+    collapse = ", "
+  )
+)
+
+message(
+  "Censoring variables: ",
+  paste(
+    censor_vars,
+    collapse = ", "
+  )
+)
+
+
+# ------------------------------------------------------------------------------
+# Basic input checks 
+# ------------------------------------------------------------------------------
+
+if (K == 0L) {
+  stop("No outcome variables matching ^died_kplus1_[0-9]+$ were found.")
+}
+
+if (length(censor_vars) != K) {
+  stop(
+    "Outcome/censoring time-point mismatch: ",
+    K,
+    " outcome columns but ",
+    length(censor_vars),
+    " censoring columns."
+  )
+}
+
+required_id_vars <- c("person_id", "empa")
+
+missing_id_vars <- setdiff(
+  required_id_vars,
+  names(df)
+)
+
+if (length(missing_id_vars) > 0) {
+  stop(
+    "Missing required column(s): ",
+    paste(missing_id_vars, collapse = ", ")
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Treatment = integer 0/1
+# ------------------------------------------------------------------------------
+
+df$empa <- as.integer(
+  as.character(
+    df$empa
+  )
+)
+
+# ------------------------------------------------------------------------------
+# Outcome / censor variables = numeric
+# ------------------------------------------------------------------------------
+
+for (
+  v in c(
+    outcome_vars,
+    censor_vars
+  )
+) {
+  df[[v]] <- as.numeric(
+    df[[v]]
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Restore known factor variables after CSV import
+# ------------------------------------------------------------------------------
+
+factor_vars <- c(
+  "cohort_year_recoded",
+  "male",
+  "su_before_initiation",
+  "metformin_monotherapy_before_initiation",
+  "lipid_lowering_before_initiation",
+  "anti_htn_before_initiation",
+  "glp1ra_before_initiation",
+  "anti_platelet_before_initiation",
+  "anticoag_before_initiation",
+  "insulin_before_initiation",
+  "hf",
+  "smi",
+  "copd",
+  "ra",
+  "asthma",
+  "epilepsy",
+  "dementia",
+  "ibd",
+  "liver",
+  "imd_quintile",
+  "completed_eth_recoded",
+  "mi_eth_recoded",
+  "completed_smoking_status",
+  "mi_smoking_status",
+  "mi_egfr_at_initiation",
+  "mi_bmi_at_initiation",
+  "mi_hba1c_at_initiation",
+  "mi_hdl_at_initiation",
+  "mi_ldl_at_initiation",
+  "mi_sbp_at_initiation"
+)
+
+
+for (
+  v in intersect(
+    factor_vars,
+    names(df)
+  )
+) {
+  
+  df[[v]] <- as.factor(
+    df[[v]]
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Collapse ethnicity levels 3 + 4 (mixed/other) 
+# ------------------------------------------------------------------------------
+
+if (
+  "completed_eth_recoded" %in% names(df)
+) {
+  
+  eth <- as.character(
+    df$completed_eth_recoded
+  )
+  
+  eth[
+    eth %in% c(
+      "3",
+      "4"
+    )
+  ] <- "3_4"
+  
+  df$completed_eth_recoded <- factor(
+    eth
+  )
+}
+
+
+# ==============================================================================
+# 5. DEFINE BASELINE COVARIATES
+# ==============================================================================
+
+baseline_vars <- setdiff(
+  names(df),
+  c(
+    "person_id",
+    "empa",
+    outcome_vars,
+    censor_vars
+  )
+)
+
+message(
+  "Baseline variables (",
+  length(baseline_vars),
+  "): ",
+  paste(
+    baseline_vars,
+    collapse = ", "
+  )
+)
+
+
+# ==============================================================================
+# 6. SAVE EXACT INPUT USED
+# ==============================================================================
+
+write.csv(
+  df,
+  file.path(
+    OUTPUT_DIR,
+    "input_dataset_used.csv"
+  ),
+  row.names = FALSE
+)
+
+saveRDS(
+  df,
+  file.path(
+    OUTPUT_DIR,
+    "input_dataset_used.rds"
+  )
+)
+
+write.csv(
+  tibble(
+    analysis = ANALYSIS_LABEL,
+    file = DATA_FILE,
+    n = nrow(df),
+    n_empa = sum(
+      df$empa == 1,
+      na.rm = TRUE
+    ),
+    n_dpp4i = sum(
+      df$empa == 0,
+      na.rm = TRUE
+    ),
+    timepoints = K,
+    tmle_folds = TMLE_FOLDS,
+    nuisance_folds = NUISANCE_FOLDS
+  ),
+  file.path(
+    OUTPUT_DIR,
+    "input_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ==============================================================================
+# 7. SUPER LEARNER LIBRARIES
+# ==============================================================================
+
+PARAMETRIC_LIBRARY <- "SL.glm"
+
+
+# ------------------------------------------------------------------------------
+# Ridge wrapper
+#
+# SuperLearner::SL.glmnet uses:
+#   alpha = 0 -> ridge
+# ------------------------------------------------------------------------------
+
+SL.glmnet.ridge <- function(
+    Y,
+    X,
+    newX,
+    family,
+    obsWeights,
+    id,
+    ...) {
+  
+  SuperLearner::SL.glmnet(
+    Y = Y,
+    X = X,
+    newX = newX,
+    family = family,
+    obsWeights = obsWeights,
+    id = id,
+    alpha = 0,
+    nfolds = NUISANCE_FOLDS,
+    ...
+  )
+}
+
+SL.ranger.fast <- function(Y, X, newX, family, obsWeights, ...) {
+  SL.ranger(
+    Y = Y,
+    X = X,
+    newX = newX,
+    mtry = ncol(X),
+    family = family,
+    obsWeights = obsWeights,
+    num.trees = 200,
+    min.node.size = 20,
+    num.threads = 1,
+    write.forest = TRUE,
+    ...
+  )
+}
+
+
+SUPERLEARNER_LIBRARY <- c(
+  "SL.mean",
+  "SL.glm",
+  "SL.ranger.fast",
+  "SL.rpart",
+  "SL.glmnet.ridge"
+)
+
+
+# ==============================================================================
+# 8. ALLOW LMTP TO SEE CUSTOM SL.glmnet.ridge
+# ==============================================================================
+
+patch_lmtp_run_ensemble <- function() {
+  
+  ns <- asNamespace("lmtp")
+  
+  original <- get(
+    "run_ensemble",
+    envir = ns
+  )
+  
+  
+  expected_args <- c(
+    "data",
+    "y",
+    "learners",
+    "outcome_type",
+    "id",
+    "folds"
+  )
+  
+  
+  if (
+    !identical(
+      names(
+        formals(original)
+      ),
+      expected_args
+    )
+  ) {
+    
+    stop(
+      paste0(
+        "Your lmtp:::run_ensemble() signature differs from the version ",
+        "this script was written for. Check packageVersion('lmtp')."
+      )
+    )
+  }
+  
+  
+  patched <- function(
+    data,
+    y,
+    learners,
+    outcome_type,
+    id,
+    folds) {
+    
+    n_ids <- length(
+      unique(
+        data[[id]]
+      )
+    )
+    
+    if (
+      folds > n_ids
+    ) {
+      stop(
+        "Number of nuisance folds exceeds number of unique IDs."
+      )
+    }
+    
+    
+    family <- if (
+      outcome_type == "binomial"
+    ) {
+      binomial()
+    } else {
+      gaussian()
+    }
+    
+    
+    cv_control <- SuperLearner::SuperLearner.CV.control(
+      V = folds
+    )
+    
+    
+    features <- setdiff(
+      names(data),
+      c(
+        id,
+        y
+      )
+    )
+    
+    
+    X <- data[
+      ,
+      features,
+      drop = FALSE
+    ]
+    
+    Y <- data[[y]]
+    
+    
+    fit <- SuperLearner::SuperLearner(
+      Y = Y,
+      X = X,
+      family = family,
+      SL.library = learners,
+      id = data[[id]],
+      method = "method.NNLS",
+      env = globalenv(),
+      cvControl = cv_control
+    )
+    
+    
+    class(fit) <- c(
+      "lmtp_ensemble",
+      class(fit)
+    )
+    
+    fit
+  }
+  
+  
+  assignInNamespace(
+    x = "run_ensemble",
+    value = patched,
+    ns = "lmtp"
+  )
+  
+  
+  original
+}
+
+
+restore_lmtp_run_ensemble <- function(
+    original) {
+  
+  assignInNamespace(
+    x = "run_ensemble",
+    value = original,
+    ns = "lmtp"
+  )
+  
+  invisible(NULL)
+}
+
+
+writeLines(
+  c(
+    paste0("lmtp=", as.character(packageVersion("lmtp"))),
+    paste0("SuperLearner=", as.character(packageVersion("SuperLearner")))
+  ),
+  con = file.path(OUTPUT_DIR, "CORE_PACKAGE_VERSIONS_BEFORE_RUN.txt")
+)
+
+ORIGINAL_RUN_ENSEMBLE <- patch_lmtp_run_ensemble()
+
+
+# ==============================================================================
+# 9. HELPER FUNCTIONS
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# IFE extraction
+# ------------------------------------------------------------------------------
+
+ife_value <- function(x) {
+  as.numeric(
+    x@x
+  )
+}
+
+
+ife_se <- function(x) {
+  as.numeric(
+    x@std_error
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Runtime
+# ------------------------------------------------------------------------------
+
+format_runtime <- function(
+    seconds) {
+  
+  h <- floor(
+    seconds / 3600
+  )
+  
+  m <- floor(
+    (
+      seconds %% 3600
+    ) / 60
+  )
+  
+  s <- round(
+    seconds %% 60
+  )
+  
+  sprintf(
+    "%02d:%02d:%02d",
+    h,
+    m,
+    s
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Extract mortality RD and RR from survival estimates
+# ------------------------------------------------------------------------------
+
+extract_effect_result <- function(
+    fit_empa,
+    fit_dpp4i) {
+  
+  survival_empa <- ife_value(
+    fit_empa$estimate
+  )
+  
+  survival_dpp4i <- ife_value(
+    fit_dpp4i$estimate
+  )
+  
+  
+  risk_empa <- 1 - survival_empa
+  risk_dpp4i <- 1 - survival_dpp4i
+  
+  
+  # Mortality RD:
+  # risk EMPA - risk DPP4i
+  # = S_DPP4i - S_EMPA
+  
+  rd_object <- (
+    fit_dpp4i$estimate -
+      fit_empa$estimate
+  )
+  
+  rd <- ife_value(
+    rd_object
+  )
+  
+  rd_se <- ife_se(
+    rd_object
+  )
+  
+  rd_lower <- rd - 1.96 * rd_se
+  rd_upper <- rd + 1.96 * rd_se
+  
+  
+  # Mortality RR
+  
+  logrr_object <- (
+    log(
+      1 -
+        fit_empa$estimate
+    ) -
+      log(
+        1 -
+          fit_dpp4i$estimate
+      )
+  )
+  
+  
+  logrr <- ife_value(
+    logrr_object
+  )
+  
+  logrr_se <- ife_se(
+    logrr_object
+  )
+  
+  
+  rr <- exp(
+    logrr
+  )
+  
+  rr_lower <- exp(
+    logrr -
+      1.96 * logrr_se
+  )
+  
+  rr_upper <- exp(
+    logrr +
+      1.96 * logrr_se
+  )
+  
+  
+  tibble(
+    survival_empa = survival_empa,
+    survival_dpp4i = survival_dpp4i,
+    
+    risk_empa = risk_empa,
+    risk_dpp4i = risk_dpp4i,
+    
+    rd = rd,
+    rd_se = rd_se,
+    rd_lower = rd_lower,
+    rd_upper = rd_upper,
+    
+    logrr = logrr,
+    logrr_se = logrr_se,
+    
+    rr = rr,
+    rr_lower = rr_lower,
+    rr_upper = rr_upper
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Add names to density-ratio matrix
+# ------------------------------------------------------------------------------
+
+name_dr_matrix <- function(
+    x) {
+  
+  x <- as.matrix(
+    x
+  )
+  
+  colnames(x) <- paste0(
+    "v",
+    seq_len(
+      ncol(x)
+    )
+  )
+  
+  x
+}
+
+
+# ------------------------------------------------------------------------------
+# Cumulative product of density ratios
+# ------------------------------------------------------------------------------
+
+cumulative_density_ratios <- function(
+    x) {
+  
+  x <- as.matrix(
+    x
+  )
+  
+  
+  if (
+    ncol(x) == 1
+  ) {
+    
+    out <- x
+    
+  } else {
+    
+    out <- t(
+      apply(
+        x,
+        1,
+        cumprod
+      )
+    )
+  }
+  
+  
+  colnames(out) <- paste0(
+    "cum_v",
+    seq_len(
+      ncol(out)
+    )
+  )
+  
+  out
+}
+
+
+# ------------------------------------------------------------------------------
+# Save matrix with ID
+# ------------------------------------------------------------------------------
+
+save_matrix_with_id <- function(
+    matrix_object,
+    df,
+    filename) {
+  
+  out <- bind_cols(
+    df %>%
+      select(
+        person_id,
+        empa
+      ),
+    as_tibble(
+      matrix_object
+    )
+  )
+  
+  
+  write.csv(
+    out,
+    filename,
+    row.names = FALSE
+  )
+  
+  invisible(
+    out
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Flatten lmtp Super Learner coefficient lists (fits_m / fits_r)
+# ------------------------------------------------------------------------------
+
+extract_sl_weights_long <- function(fits) {
+
+  bind_rows(
+    lapply(
+      seq_along(fits),
+      function(fold_index) {
+
+        fold_fits <- fits[[fold_index]]
+
+        bind_rows(
+          lapply(
+            seq_along(fold_fits),
+            function(time_index) {
+
+              w <- fold_fits[[time_index]]
+
+              if (is.null(w) || length(w) == 0) {
+                return(NULL)
+              }
+
+              w_num <- as.numeric(w)
+              w_names <- names(w)
+
+              if (is.null(w_names) || length(w_names) != length(w_num)) {
+                w_names <- paste0("learner_", seq_along(w_num))
+              }
+
+              tibble(
+                outer_fold = fold_index,
+                timepoint = time_index,
+                learner = w_names,
+                weight = w_num
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Density-ratio summary
+# ------------------------------------------------------------------------------
+
+summarise_dr_all_timepoints <- function(
+    matched_dr) {
+  
+  matched_dr %>%
+    select(
+      starts_with("v")
+    ) %>%
+    pivot_longer(
+      everything(),
+      names_to = "timepoint",
+      values_to = "density_ratio"
+    ) %>%
+    mutate(
+      timepoint = as.integer(
+        sub(
+          "^v",
+          "",
+          timepoint
+        )
+      )
+    ) %>%
+    group_by(
+      timepoint
+    ) %>%
+    summarise(
+      n_nonmissing = sum(
+        !is.na(density_ratio)
+      ),
+      min = min(
+        density_ratio,
+        na.rm = TRUE
+      ),
+      median = median(
+        density_ratio,
+        na.rm = TRUE
+      ),
+      p95 = quantile(
+        density_ratio,
+        0.95,
+        na.rm = TRUE
+      ),
+      p99 = quantile(
+        density_ratio,
+        0.99,
+        na.rm = TRUE
+      ),
+      max = max(
+        density_ratio,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+
+# ------------------------------------------------------------------------------
+# Format CI
+# ------------------------------------------------------------------------------
+
+format_ci <- function(
+    estimate,
+    lower,
+    upper,
+    digits = 2) {
+  
+  sprintf(
+    paste0(
+      "%.",
+      digits,
+      "f (%.",
+      digits,
+      "f, %.",
+      digits,
+      "f)"
+    ),
+    estimate,
+    lower,
+    upper
+  )
+}
+
+
+
+# ==============================================================================
+# 10. HELPERS SPECIFIC TO lmtp_survival NATURAL COURSE
+# ==============================================================================
+
+extract_survival_sl_weights <- function(
+    survival_fit,
+    component = c("fits_m", "fits_r")) {
+
+  component <- match.arg(component)
+
+  bind_rows(
+    lapply(
+      seq_along(survival_fit),
+      function(horizon) {
+
+        this_fit <- survival_fit[[horizon]]
+        this_component <- this_fit[[component]]
+
+        if (is.null(this_component)) {
+          return(NULL)
+        }
+
+        extract_sl_weights_long(
+          this_component
+        ) %>%
+          mutate(
+            survival_horizon = horizon,
+            .before = 1
+          )
+      }
+    )
+  )
+}
+
+
+# ==============================================================================
+# 11. RUN ONE NATURAL-COURSE SURVIVAL ANALYSIS
+# ==============================================================================
+
+run_one_natural_course <- function(
+    model_label,
+    learner_library) {
+
+  model_dir <- if (
+    model_label == "Parametric GLM"
+  ) {
+    "parametric_GLM"
+  } else {
+    "superlearner"
+  }
+
+
+  RUN_DIR <- file.path(
+    OUTPUT_DIR,
+    model_dir,
+    "trim_Y"
+  )
+
+
+  dir.create(
+    RUN_DIR,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+
+  # ============================================================================
+  # TIMER STARTS HERE
+  # ============================================================================
+
+  start_time <- Sys.time()
+
+
+  message(
+    "\n============================================================"
+  )
+
+  message(
+    "\nSTART NATURAL COURSE: ",
+    model_label,
+    " | trim=Y",
+    " | ",
+    start_time
+  )
+
+  message(
+    "\n============================================================"
+  )
+
+
+  # ============================================================================
+  # CONTROL
+  # ============================================================================
+
+  ctrl <- lmtp_control(
+    .trim = TRIM_Y,
+    .learners_outcome_folds = NUISANCE_FOLDS,
+    .learners_trt_folds = NUISANCE_FOLDS,
+    .return_full_fits = FALSE,
+    .info = TRUE
+  )
+
+
+  # ============================================================================
+  # NATURAL-COURSE SURVIVAL CURVE
+  #
+  # ============================================================================
+
+  set.seed(
+    SEED
+  )
+
+
+  fit_natural <- lmtp_survival(
+    data = df,
+    trt = "empa",
+    outcomes = outcome_vars,
+    baseline = baseline_vars,
+    cens = censor_vars,
+    shift = NULL,
+    estimator = "lmtp_tmle",
+    mtp = FALSE,
+    learners_outcome = learner_library,
+    learners_trt = learner_library,
+    folds = TMLE_FOLDS,
+    control = ctrl
+  )
+
+
+  # Save the complete survival-curve object immediately.
+  saveRDS(
+    fit_natural,
+    file.path(
+      RUN_DIR,
+      "fit_natural_course_survival_FULL.rds"
+    )
+  )
+
+
+  # ============================================================================
+  # TIMER ENDS AFTER SURVIVAL CURVE FIT
+  # ============================================================================
+
+  end_time <- Sys.time()
+
+
+  runtime_seconds <- as.numeric(
+    difftime(
+      end_time,
+      start_time,
+      units = "secs"
+    )
+  )
+
+
+  # ============================================================================
+  # TIDY NATURAL-COURSE SURVIVAL CURVE
+  # ============================================================================
+
+  survival_curve <- generics::tidy(
+    fit_natural
+  ) %>%
+    as_tibble() %>%
+    mutate(
+      risk = 1 - estimate,
+      risk_lower = 1 - conf.high,
+      risk_upper = 1 - conf.low
+    )
+
+
+  write.csv(
+    survival_curve,
+    file.path(
+      RUN_DIR,
+      "natural_course_survival_curve.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  # Final time point = requested end of follow-up.
+  final_point <- survival_curve %>%
+    filter(
+      time == max(time)
+    ) %>%
+    slice(1)
+
+
+  # ============================================================================
+  # FULL-HORIZON DIAGNOSTICS
+  # ============================================================================
+
+  final_fit <- fit_natural[[length(fit_natural)]]
+
+
+  dr_natural <- name_dr_matrix(
+    final_fit$density_ratios
+  )
+
+
+  dr_natural_df <- save_matrix_with_id(
+    matrix_object = dr_natural,
+    df = df,
+    filename = file.path(
+      RUN_DIR,
+      "density_ratios_natural_course_ALL.csv"
+    )
+  )
+
+
+  cum_natural <- cumulative_density_ratios(
+    dr_natural
+  )
+
+
+  save_matrix_with_id(
+    matrix_object = cum_natural,
+    df = df,
+    filename = file.path(
+      RUN_DIR,
+      "cumulative_weights_natural_course_ALL.csv"
+    )
+  )
+
+
+  # ============================================================================
+  # DR1
+  # ============================================================================
+
+  dr1 <- dr_natural_df %>%
+    left_join(
+      df %>%
+        select(
+          person_id,
+          c_kplus1_1
+        ),
+      by = "person_id"
+    ) %>%
+    filter(
+      c_kplus1_1 == 1,
+      is.finite(v1)
+    ) %>%
+    arrange(
+      desc(v1)
+    )
+
+
+  write.csv(
+    dr1,
+    file.path(
+      RUN_DIR,
+      "DR1_individual_values.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  write.csv(
+    head(
+      dr1,
+      100
+    ),
+    file.path(
+      RUN_DIR,
+      "DR1_TOP100.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  dr1_summary <- dr1 %>%
+    summarise(
+      n = n(),
+      min_dr1 = min(
+        v1,
+        na.rm = TRUE
+      ),
+      median_dr1 = median(
+        v1,
+        na.rm = TRUE
+      ),
+      p95_dr1 = quantile(
+        v1,
+        0.95,
+        na.rm = TRUE
+      ),
+      p99_dr1 = quantile(
+        v1,
+        0.99,
+        na.rm = TRUE
+      ),
+      max_dr1 = max(
+        v1,
+        na.rm = TRUE
+      )
+    )
+
+
+  write.csv(
+    dr1_summary,
+    file.path(
+      RUN_DIR,
+      "DR1_summary.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  # ============================================================================
+  # ALL TIME-POINT DENSITY-RATIO SUMMARY
+  # ============================================================================
+
+  dr_all_summary <- summarise_dr_all_timepoints(
+    dr_natural_df
+  )
+
+
+  write.csv(
+    dr_all_summary,
+    file.path(
+      RUN_DIR,
+      "density_ratio_summary_ALL_timepoints.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  # ============================================================================
+  # OUTCOME REGRESSION OUTPUT FROM FINAL HORIZON
+  # ============================================================================
+
+  outcome_reg_natural <- as.data.frame(
+    final_fit$outcome_reg
+  )
+
+
+  write.csv(
+    bind_cols(
+      person_id = df$person_id,
+      outcome_reg_natural
+    ),
+    file.path(
+      RUN_DIR,
+      "outcome_regression_natural_course_final_horizon.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  saveRDS(
+    final_fit$outcome_reg,
+    file.path(
+      RUN_DIR,
+      "outcome_regression_natural_course_final_horizon.rds"
+    )
+  )
+
+
+  # ============================================================================
+  # NUISANCE FITS / SUPER LEARNER WEIGHTS
+  # ============================================================================
+
+  saveRDS(
+    lapply(
+      fit_natural,
+      function(x) x$fits_m
+    ),
+    file.path(
+      RUN_DIR,
+      "outcome_nuisance_fits_natural_course_ALL_horizons.rds"
+    )
+  )
+
+
+  saveRDS(
+    lapply(
+      fit_natural,
+      function(x) x$fits_r
+    ),
+    file.path(
+      RUN_DIR,
+      "treatment_censoring_nuisance_fits_natural_course_ALL_horizons.rds"
+    )
+  )
+
+
+  write.csv(
+    extract_survival_sl_weights(
+      fit_natural,
+      component = "fits_m"
+    ),
+    file.path(
+      RUN_DIR,
+      "SL_weights_outcome_natural_course_ALL_horizons.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  write.csv(
+    extract_survival_sl_weights(
+      fit_natural,
+      component = "fits_r"
+    ),
+    file.path(
+      RUN_DIR,
+      "SL_weights_treatment_censoring_natural_course_ALL_horizons.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  # ============================================================================
+  # PLOTS
+  # ============================================================================
+
+  p_survival <- ggplot(
+    survival_curve,
+    aes(
+      x = time,
+      y = estimate
+    )
+  ) +
+    geom_line() +
+    geom_point() +
+    geom_ribbon(
+      aes(
+        ymin = conf.low,
+        ymax = conf.high
+      ),
+      alpha = 0.2
+    ) +
+    labs(
+      x = "Time point",
+      y = "Natural-course survival",
+      title = paste0(
+        "Natural course | ",
+        model_label
+      )
+    ) +
+    theme_classic(
+      base_size = 12
+    )
+
+
+  ggsave(
+    file.path(
+      RUN_DIR,
+      "natural_course_survival_curve.png"
+    ),
+    p_survival,
+    width = 7,
+    height = 5,
+    dpi = 300
+  )
+
+
+  p_hist <- ggplot(
+    dr1,
+    aes(
+      x = v1
+    )
+  ) +
+    geom_histogram(
+      bins = 50
+    ) +
+    labs(
+      x = "DR1",
+      y = "Count",
+      title = paste0(
+        "Natural course | ",
+        model_label,
+        " | trim Y"
+      )
+    ) +
+    theme_classic(
+      base_size = 12
+    )
+
+
+  ggsave(
+    file.path(
+      RUN_DIR,
+      "DR1_histogram.png"
+    ),
+    p_hist,
+    width = 7,
+    height = 5,
+    dpi = 300
+  )
+
+
+  p_max <- ggplot(
+    dr_all_summary,
+    aes(
+      x = timepoint,
+      y = max
+    )
+  ) +
+    geom_line() +
+    geom_point() +
+    scale_x_continuous(
+      breaks = seq_len(K)
+    ) +
+    labs(
+      x = "Time point",
+      y = "Maximum density ratio",
+      title = paste0(
+        "Natural course | ",
+        model_label,
+        " | trim Y"
+      )
+    ) +
+    theme_classic(
+      base_size = 12
+    )
+
+
+  ggsave(
+    file.path(
+      RUN_DIR,
+      "maximum_density_ratio_by_timepoint.png"
+    ),
+    p_max,
+    width = 7,
+    height = 5,
+    dpi = 300
+  )
+
+
+  # ============================================================================
+  # FINAL RESULT ROW
+  # ============================================================================
+
+  result <- tibble(
+    analysis = ANALYSIS_LABEL,
+    estimand = "Natural course",
+    nuisance_model = model_label,
+    trim_applied = "Y",
+    trim_value = TRIM_Y,
+    timepoints = K,
+    learners = paste(
+      learner_library,
+      collapse = "; "
+    ),
+
+    survival = final_point$estimate,
+    survival_se = final_point$std.error,
+    survival_lower = final_point$conf.low,
+    survival_upper = final_point$conf.high,
+
+    risk = final_point$risk,
+    risk_se = final_point$std.error,
+    risk_lower = final_point$risk_lower,
+    risk_upper = final_point$risk_upper,
+
+    min_dr1 = dr1_summary$min_dr1,
+    median_dr1 = dr1_summary$median_dr1,
+    p95_dr1 = dr1_summary$p95_dr1,
+    p99_dr1 = dr1_summary$p99_dr1,
+    max_dr1 = dr1_summary$max_dr1,
+
+    runtime_seconds = runtime_seconds,
+    runtime_minutes = runtime_seconds / 60,
+    runtime = format_runtime(
+      runtime_seconds
+    ),
+
+    start_time = as.character(
+      start_time
+    ),
+    end_time = as.character(
+      end_time
+    )
+  )
+
+
+  write.csv(
+    result,
+    file.path(
+      RUN_DIR,
+      "natural_course_final_result.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  write.csv(
+    tibble(
+      start_time = as.character(
+        start_time
+      ),
+      end_time = as.character(
+        end_time
+      ),
+      runtime_seconds = runtime_seconds,
+      runtime_minutes = runtime_seconds / 60,
+      runtime = format_runtime(
+        runtime_seconds
+      )
+    ),
+    file.path(
+      RUN_DIR,
+      "runtime.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+  capture.output(
+    sessionInfo(),
+    file = file.path(
+      RUN_DIR,
+      "sessionInfo.txt"
+    )
+  )
+
+
+  message(
+    "\nFINISHED NATURAL COURSE: ",
+    model_label,
+    " | trim=Y",
+    " | runtime ",
+    format_runtime(
+      runtime_seconds
+    )
+  )
+
+
+  rm(
+    fit_natural,
+    final_fit
+  )
+
+  gc()
+
+
+  result
+}
+
+
+# ==============================================================================
+# 12. RUN THE TWO NATURAL-COURSE ANALYSES
+# ==============================================================================
+
+all_results <- list()
+
+
+# ------------------------------------------------------------------------------
+# 1. Parametric GLM + trim
+# ------------------------------------------------------------------------------
+
+all_results[[1]] <- run_one_natural_course(
+  model_label = "Parametric GLM",
+  learner_library = PARAMETRIC_LIBRARY
+)
+
+
+write.csv(
+  bind_rows(all_results),
+  file.path(
+    OUTPUT_DIR,
+    "INTERIM_RESULTS.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ------------------------------------------------------------------------------
+# 2. Super Learner + trim
+# ------------------------------------------------------------------------------
+
+all_results[[2]] <- run_one_natural_course(
+  model_label = "Super Learner",
+  learner_library = SUPERLEARNER_LIBRARY
+)
+
+
+write.csv(
+  bind_rows(all_results),
+  file.path(
+    OUTPUT_DIR,
+    "INTERIM_RESULTS.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ==============================================================================
+# 13. RESTORE ORIGINAL LMTP FUNCTION
+# ==============================================================================
+
+restore_lmtp_run_ensemble(
+  ORIGINAL_RUN_ENSEMBLE
+)
+
+
+# ==============================================================================
+# 14. SAVE RESULTS
+# ==============================================================================
+
+results_raw <- bind_rows(
+  all_results
+)
+
+
+write.csv(
+  results_raw,
+  file.path(
+    OUTPUT_DIR,
+    "ALL_2_NATURAL_COURSE_RUNS_RAW.csv"
+  ),
+  row.names = FALSE
+)
+
+
+saveRDS(
+  results_raw,
+  file.path(
+    OUTPUT_DIR,
+    "ALL_2_NATURAL_COURSE_RUNS_RAW.rds"
+  )
+)
+
+
+# ==============================================================================
+# 15. FINAL TABLE
+# ==============================================================================
+
+final_table <- results_raw %>%
+  mutate(
+
+    Analysis = nuisance_model,
+
+    `Natural-course survival` = mapply(
+      format_ci,
+      survival,
+      survival_lower,
+      survival_upper,
+      MoreArgs = list(
+        digits = 3
+      )
+    ),
+
+    `Survival SE` = sprintf(
+      "%.4f",
+      survival_se
+    ),
+
+    `Natural-course mortality risk` = mapply(
+      format_ci,
+      risk,
+      risk_lower,
+      risk_upper,
+      MoreArgs = list(
+        digits = 3
+      )
+    ),
+
+    `Risk SE` = sprintf(
+      "%.4f",
+      risk_se
+    ),
+
+    `Median DR1` = sprintf(
+      "%.3f",
+      median_dr1
+    ),
+
+    `95th PCT DR1` = sprintf(
+      "%.3f",
+      p95_dr1
+    ),
+
+    `Max DR1` = sprintf(
+      "%.3f",
+      max_dr1
+    ),
+
+    Runtime = runtime
+  ) %>%
+
+  select(
+    Analysis,
+    `Natural-course survival`,
+    `Survival SE`,
+    `Natural-course mortality risk`,
+    `Risk SE`,
+    `Median DR1`,
+    `95th PCT DR1`,
+    `Max DR1`,
+    Runtime
+  )
+
+
+write.csv(
+  final_table,
+  file.path(
+    OUTPUT_DIR,
+    "FINAL_2_RUN_NATURAL_COURSE_TABLE.csv"
+  ),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 16. PRINT RESULTS
+# ==============================================================================
+
+cat(
+  "\n\n============================================================\n"
+)
+
+cat(
+  "BOTH NATURAL-COURSE ANALYSES COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+print(
+  final_table
+)
+
+cat(
+  "\nOutputs saved to:\n",
+  OUTPUT_DIR,
+  "\n"
+)
+
+
+writeLines(
+  paste0(
+    "Completed: ",
+    as.character(
+      Sys.time()
+    )
+  ),
+  con = file.path(
+    OUTPUT_DIR,
+    "JOB_COMPLETE.txt"
+  )
+)
